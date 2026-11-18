@@ -1,108 +1,152 @@
 import { NextRequest, NextResponse } from 'next/server';
+import * as http from 'http';
+import * as https from 'https';
+import * as net from 'net';
 
-function buildHeaders(token: string, tokenType: 'bot' | 'user'): Record<string, string> {
-  if (tokenType === 'bot') {
-    return { 'Content-Type': 'application/json', Authorization: `Bot ${token}` };
-  }
+interface ProxyConfig { host: string; port: number; username?: string; password?: string; }
+
+function parseProxy(proxyUrl: string): ProxyConfig {
+  const u = new URL(proxyUrl);
   return {
-    'Content-Type': 'application/json',
-    Authorization: token,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'X-Discord-Locale': 'ja',
-    'X-Super-Properties': Buffer.from(JSON.stringify({
-      os: 'Windows', browser: 'Chrome', device: '', system_locale: 'ja',
-      browser_user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      browser_version: '124.0.0.0', os_version: '10', release_channel: 'stable',
-      client_build_number: 305412, design_id: 0, client_event_source: null,
-    })).toString('base64'),
+    host: u.hostname, port: parseInt(u.port, 10),
+    username: u.username || undefined, password: u.password || undefined,
   };
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, maxRetries = 3): Promise<Response> {
-  let res = await fetch(url, init);
-  for (let attempt = 0; attempt < maxRetries && res.status === 429; attempt++) {
-    let retryAfterMs = 1000;
-    try { const body = await res.clone().json(); if (typeof body.retry_after === 'number') retryAfterMs = Math.ceil(body.retry_after * 1000); } catch (_) {}
-    const raHeader = res.headers.get('Retry-After');
-    if (raHeader) { const parsed = parseFloat(raHeader) * 1000; if (!isNaN(parsed)) retryAfterMs = Math.ceil(parsed); }
-    retryAfterMs = Math.min(retryAfterMs, 60000);
-    await new Promise((r) => setTimeout(r, retryAfterMs));
-    res = await fetch(url, init);
-  }
-  return res;
+function httpTunnelConnect(proxy: ProxyConfig, targetHost: string, targetPort: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: proxy.host, port: proxy.port, method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: proxy.username
+        ? { 'Proxy-Authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}` }
+        : {},
+    });
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('HTTP CONNECT timeout')); });
+    req.on('connect', (_res, socket) => resolve(socket));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function fetchViaProxy(
+  url: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string },
+  proxyUrl: string
+): Promise<{ ok: boolean; status: number; json: () => Promise<any> }> {
+  const target = new URL(url);
+  const proxy = parseProxy(proxyUrl);
+  const socket = await httpTunnelConnect(proxy, target.hostname, 443);
+
+  return new Promise((resolve, reject) => {
+    const agent = new https.Agent({ socket } as any);
+    const reqOptions: https.RequestOptions = {
+      hostname: target.hostname,
+      path: target.pathname + target.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      agent,
+    };
+    const req = https.request(reqOptions, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString();
+        resolve({
+          ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
+          status: res.statusCode ?? 0,
+          json: async () => JSON.parse(text),
+        });
+      });
+    });
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+async function discordFetch(
+  path: string,
+  token: string,
+  tokenType: 'bot' | 'user',
+  options: { method?: string; body?: any } = {},
+  proxyUrl?: string | null
+) {
+  const url = `https://discord.com/api/v10${path}`;
+  const headers: Record<string, string> = {
+    Authorization: tokenType === 'bot' ? `Bot ${token}` : token,
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  };
+  const fetchOptions = {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  };
+
+  if (proxyUrl) return fetchViaProxy(url, fetchOptions, proxyUrl);
+  return fetch(url, fetchOptions);
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const action = req.nextUrl.searchParams.get('action');
     const body = await req.json();
-    const { tokens, tokenType = 'bot', guildId, channelId, content, count = 1 }: {
-      tokens: string[]; tokenType: 'bot' | 'user'; guildId?: string; channelId?: string; content?: string; count?: number;
-    } = body;
+    const { action, token, tokenType = 'user', proxy } = body;
 
-    if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
-      return NextResponse.json({ error: '有効なトークンが指定されていません。' }, { status: 400 });
-    }
+    if (!token) return NextResponse.json({ error: 'Token required' }, { status: 400 });
 
     if (action === 'getGuilds') {
-      const guildSets: Set<string>[] = [];
-      const guildMap = new Map<string, { id: string; name: string }>();
-      for (const token of tokens) {
-        const res = await fetchWithRetry('https://discord.com/api/v10/users/@me/guilds', { method: 'GET', headers: buildHeaders(token, tokenType) });
-        if (!res.ok) { const errText = await res.text(); return NextResponse.json({ error: `サーバー取得失敗 (${res.status}): ${errText}` }, { status: res.status }); }
-        const guilds = await res.json();
-        const ids = new Set<string>();
-        for (const g of guilds) { ids.add(g.id); guildMap.set(g.id, { id: g.id, name: g.name }); }
-        guildSets.push(ids);
-      }
-      let commonIds = guildSets[0];
-      for (let i = 1; i < guildSets.length; i++) commonIds = new Set([...commonIds].filter((id) => guildSets[i].has(id)));
-      return NextResponse.json(Array.from(commonIds).map((id) => guildMap.get(id)!));
+      const res = await discordFetch('/users/@me/guilds', token, tokenType, {}, proxy);
+      if (!res.ok) return NextResponse.json({ error: `Discord error ${res.status}` }, { status: res.status });
+      const guilds = await res.json();
+      return NextResponse.json({ guilds });
     }
 
     if (action === 'getChannels') {
-      if (!guildId) return NextResponse.json({ error: 'サーバーIDが指定されていません。' }, { status: 400 });
-      const res = await fetchWithRetry(`https://discord.com/api/v10/guilds/${guildId}/channels`, { method: 'GET', headers: buildHeaders(tokens[0], tokenType) });
-      if (!res.ok) { const errText = await res.text(); return NextResponse.json({ error: `チャンネル取得失敗 (${res.status}): ${errText}` }, { status: res.status }); }
-      return NextResponse.json(await res.json());
+      const { guildId } = body;
+      if (!guildId) return NextResponse.json({ error: 'guildId required' }, { status: 400 });
+      const res = await discordFetch(`/guilds/${guildId}/channels`, token, tokenType, {}, proxy);
+      if (!res.ok) return NextResponse.json({ error: `Discord error ${res.status}` }, { status: res.status });
+      const channels = await res.json();
+      return NextResponse.json({ channels });
     }
 
     if (action === 'sendMessage') {
-      if (!channelId || !content) return NextResponse.json({ error: 'チャンネルIDまたはメッセージ内容が不足しています。' }, { status: 400 });
-      const details: { tokenPrefix: string; success: number; failed: number; lastError?: string }[] = [];
-      for (const token of tokens) {
-        const prefix = token.substring(0, 10) + '...';
-        let successCount = 0, failCount = 0, lastError = '';
-        for (let i = 0; i < count; i++) {
-          try {
-            const res = await fetchWithRetry(`https://discord.com/api/v10/channels/${channelId}/messages`, { method: 'POST', headers: buildHeaders(token, tokenType), body: JSON.stringify({ content }) });
-            if (res.ok) { successCount++; }
-            else { failCount++; const errData = await res.json().catch(() => ({})); lastError = (errData as any).message || `HTTP ${res.status}`; }
-          } catch (err: any) { failCount++; lastError = err.message || 'ネットワークエラー'; }
-        }
-        details.push({ tokenPrefix: prefix, success: successCount, failed: failCount, ...(lastError ? { lastError } : {}) });
+      const { channelId, message } = body;
+      if (!channelId || !message) return NextResponse.json({ error: 'channelId and message required' }, { status: 400 });
+      const res = await discordFetch(
+        `/channels/${channelId}/messages`,
+        token, tokenType,
+        { method: 'POST', body: { content: message } },
+        proxy
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        return NextResponse.json({ error: `Discord error ${res.status}`, details: err }, { status: res.status });
       }
-      return NextResponse.json({ details });
+      const data = await res.json();
+      return NextResponse.json({ success: true, messageId: data.id });
     }
 
     if (action === 'joinGuild') {
-      const { inviteCode }: { inviteCode?: string } = body;
-      if (!inviteCode) return NextResponse.json({ error: '招待コードが指定されていません。' }, { status: 400 });
-      const trimmed = inviteCode.trim().replace(/^https?:\/\/discord\.gg\//, '');
-      const results: { tokenPrefix: string; success: boolean; error?: string }[] = [];
-      for (const token of tokens) {
-        const prefix = token.substring(0, 10) + '...';
-        try {
-          const res = await fetchWithRetry(`https://discord.com/api/v10/invites/${trimmed}`, { method: 'POST', headers: buildHeaders(token, tokenType), body: JSON.stringify({}) });
-          if (res.ok) { results.push({ tokenPrefix: prefix, success: true }); }
-          else { const errData = await res.json().catch(() => ({})); results.push({ tokenPrefix: prefix, success: false, error: (errData as any).message || `HTTP ${res.status}` }); }
-        } catch (err: any) { results.push({ tokenPrefix: prefix, success: false, error: err.message || 'ネットワークエラー' }); }
+      const { inviteCode } = body;
+      if (!inviteCode) return NextResponse.json({ error: 'inviteCode required' }, { status: 400 });
+      const res = await discordFetch(
+        `/invites/${inviteCode}`,
+        token, tokenType,
+        { method: 'POST', body: {} },
+        proxy
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        return NextResponse.json({ error: `Discord error ${res.status}`, details: err }, { status: res.status });
       }
-      return NextResponse.json({ results });
+      const data = await res.json();
+      return NextResponse.json({ success: true, guild: data.guild?.name });
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
   }
-        }
+}
