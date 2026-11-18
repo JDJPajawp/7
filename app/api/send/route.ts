@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { fetchViaProxy } from '../proxy-agent/route';
 
 function buildHeaders(token: string, tokenType: 'bot' | 'user'): Record<string, string> {
   if (tokenType === 'bot') {
