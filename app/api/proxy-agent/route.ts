@@ -11,7 +11,7 @@ interface ProxyConfig {
   password?: string;
 }
 
-export function parseProxy(proxyUrl: string): ProxyConfig {
+function parseProxy(proxyUrl: string): ProxyConfig {
   const url = new URL(proxyUrl);
   const type = url.protocol.replace(':', '') as 'socks5' | 'http';
   return {
@@ -47,10 +47,7 @@ function socks5Connect(proxy: ProxyConfig, targetHost: string, targetPort: numbe
           req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
           req[4] = hostBuf.length; hostBuf.copy(req, 5); req.writeUInt16BE(targetPort, 5 + hostBuf.length);
           socket.write(req);
-          socket.once('data', (res) => {
-            if (res[1] !== 0x00) return reject(new Error(`SOCKS5: Connect failed (${res[1]})`));
-            resolve(socket);
-          });
+          socket.once('data', (res) => { if (res[1] !== 0x00) return reject(new Error(`SOCKS5: Connect failed (${res[1]})`)); resolve(socket); });
         }
       });
     });
@@ -82,7 +79,7 @@ async function createProxyAgent(proxy: ProxyConfig, targetUrl: string): Promise<
   return new https.Agent({ socket } as any);
 }
 
-export async function fetchViaProxy(url: string, init: RequestInit, proxyUrl: string, maxRetries = 3): Promise<Response> {
+async function fetchViaProxyInternal(url: string, init: RequestInit, proxyUrl: string, maxRetries = 3): Promise<Response> {
   const proxy = parseProxy(proxyUrl);
   async function attempt(): Promise<Response> {
     const agent = await createProxyAgent(proxy, url);
@@ -117,21 +114,13 @@ export async function fetchViaProxy(url: string, init: RequestInit, proxyUrl: st
   return res;
 }
 
-export async function createProxiedWebSocket(gatewayUrl: string, proxyUrl: string): Promise<net.Socket> {
-  const proxy = parseProxy(proxyUrl);
-  const url = new URL(gatewayUrl);
-  const targetHost = url.hostname;
-  const targetPort = url.port ? parseInt(url.port) : 443;
-  return proxy.type === 'socks5' ? socks5Connect(proxy, targetHost, targetPort) : httpConnect(proxy, targetHost, targetPort);
-}
-
 export async function POST(req: NextRequest) {
   try {
     const { proxyUrl } = await req.json();
     if (!proxyUrl) return NextResponse.json({ error: 'proxyUrl is required' }, { status: 400 });
     const start = Date.now();
     try {
-      const res = await fetchViaProxy('https://discord.com/api/v10/gateway', { method: 'GET', headers: { 'Content-Type': 'application/json' } }, proxyUrl, 0);
+      const res = await fetchViaProxyInternal('https://discord.com/api/v10/gateway', { method: 'GET', headers: { 'Content-Type': 'application/json' } }, proxyUrl, 0);
       const data = await res.json().catch(() => ({}));
       return NextResponse.json({ ok: res.status === 200, status: res.status, latencyMs: Date.now() - start, gatewayUrl: (data as any).url || null });
     } catch (err: any) {
@@ -140,4 +129,4 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
-                      }
+      }
