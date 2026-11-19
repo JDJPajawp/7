@@ -1,17 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server';
 import WebSocket from 'ws';
+import * as zlib from 'zlib';
 
-// ws が返す RawData を安全に文字列化
-function rawToString(raw: any): string {
-  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
-  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
-  if (Array.isArray(raw)) return Buffer.concat(raw as Buffer[]).toString('utf8');
-  return String(raw);
+// ws が返す RawData を安全にBufferに変換
+function rawToBuffer(raw: any): Buffer {
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw);
+  if (Array.isArray(raw)) return Buffer.concat(raw as Buffer[]);
+  return Buffer.from(String(raw), 'utf8');
 }
 
-// ─────────────────────────────────────────────
-// 型定義
-// ─────────────────────────────────────────────
+// zlib圧縮されてたらinflate、そうでなければそのままUTF8
+function rawToString(raw: any): string {
+  const buf = rawToBuffer(raw);
+  if (buf.length >= 2 && buf[0] === 0x78) {
+    return zlib.inflateSync(buf).toString('utf8');
+  }
+  return buf.toString('utf8');
+}
+
 interface GatewaySession {
   ws: WebSocket | null;
   heartbeatTimer: NodeJS.Timeout | null;
@@ -124,6 +131,7 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
             d: {
               token: tokenType === 'bot' ? `Bot ${token}` : token,
               intents: 0,
+              compress: false,
               properties: {
                 os: 'Windows',
                 browser: 'Chrome',
@@ -247,4 +255,4 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
   }
-  }
+      }
