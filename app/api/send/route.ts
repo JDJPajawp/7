@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import * as tls from 'tls';
 
 interface ProxyConfig { host: string; port: number; username?: string; password?: string; }
 
@@ -38,32 +37,17 @@ async function fetchViaProxy(
   const target = new URL(url);
   const proxy = parseProxy(proxyUrl);
 
-  // TCPトンネル
   const tcpSocket = await httpTunnelConnect(proxy, target.hostname, 443);
 
-  // TLSハンドシェイク
-  const tlsSocket = tls.connect({
-    socket: tcpSocket,
-    servername: target.hostname,
-    rejectUnauthorized: true,
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    tlsSocket.once('secureConnect', resolve);
-    tlsSocket.once('error', reject);
-  });
-
   return new Promise((resolve, reject) => {
-    const reqOptions: https.RequestOptions = {
+    const req = https.request({
       hostname: target.hostname,
       path: target.pathname + target.search,
       method: options.method || 'GET',
       headers: options.headers || {},
-      // TLSソケットを直接使う
-      createConnection: () => tlsSocket,
-    };
-
-    const req = https.request(reqOptions, (res) => {
+      // TCPソケット直渡し。httpsが自動でTLSハンドシェイクする
+      createConnection: () => tcpSocket,
+    }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
@@ -74,6 +58,7 @@ async function fetchViaProxy(
           json: async () => JSON.parse(text),
         });
       });
+      res.on('error', reject);
     });
     req.on('error', reject);
     if (options.body) req.write(options.body);
@@ -165,4 +150,4 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
   }
-  }
+                           }
