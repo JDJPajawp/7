@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
+import * as tls from 'tls';
 
 interface ProxyConfig { host: string; port: number; username?: string; password?: string; }
 
@@ -22,7 +23,7 @@ function httpTunnelConnect(proxy: ProxyConfig, targetHost: string, targetPort: n
         ? { 'Proxy-Authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}` }
         : {},
     });
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('HTTP CONNECT timeout')); });
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('HTTP CONNECT: timeout')); });
     req.on('connect', (_res, socket) => resolve(socket));
     req.on('error', reject);
     req.end();
@@ -36,17 +37,32 @@ async function fetchViaProxy(
 ): Promise<{ ok: boolean; status: number; json: () => Promise<any> }> {
   const target = new URL(url);
   const proxy = parseProxy(proxyUrl);
-  const socket = await httpTunnelConnect(proxy, target.hostname, 443);
+
+  // TCPトンネル
+  const tcpSocket = await httpTunnelConnect(proxy, target.hostname, 443);
+
+  // TLSハンドシェイク
+  const tlsSocket = tls.connect({
+    socket: tcpSocket,
+    servername: target.hostname,
+    rejectUnauthorized: true,
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    tlsSocket.once('secureConnect', resolve);
+    tlsSocket.once('error', reject);
+  });
 
   return new Promise((resolve, reject) => {
-    const agent = new https.Agent({ socket } as any);
     const reqOptions: https.RequestOptions = {
       hostname: target.hostname,
       path: target.pathname + target.search,
       method: options.method || 'GET',
       headers: options.headers || {},
-      agent,
+      // TLSソケットを直接使う
+      createConnection: () => tlsSocket,
     };
+
     const req = https.request(reqOptions, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (c) => chunks.push(c));
@@ -149,4 +165,4 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
   }
-}
+  }
