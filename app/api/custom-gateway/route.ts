@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import WebSocket from 'ws';
 import * as net from 'net';
 import * as http from 'http';
-import * as tls from 'tls';
 
 interface GatewaySession {
   ws: WebSocket | null;
@@ -112,29 +111,14 @@ function httpTunnelConnect(proxy: ProxyConfig, targetHost: string, targetPort: n
 async function createProxiedWS(gatewayUrl: string, proxyUrl: string): Promise<WebSocket> {
   const proxy = parseProxy(proxyUrl);
   const url = new URL(gatewayUrl);
-  const targetHost = url.hostname;
-  const targetPort = 443;
 
-  // TCPトンネルを張る
   const tcpSocket = proxy.type === 'socks5'
-    ? await socks5Connect(proxy, targetHost, targetPort)
-    : await httpTunnelConnect(proxy, targetHost, targetPort);
+    ? await socks5Connect(proxy, url.hostname, 443)
+    : await httpTunnelConnect(proxy, url.hostname, 443);
 
-  // TCPトンネルの上にTLSを張る
-  const tlsSocket = tls.connect({
-    socket: tcpSocket,
-    servername: targetHost,
-    rejectUnauthorized: true,
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    tlsSocket.once('secureConnect', resolve);
-    tlsSocket.once('error', reject);
-  });
-
-  // TLSソケットをwsに直接渡す
+  // TCPソケットをそのまま渡す。wsがTLSハンドシェイクを自分でやる
   return new WebSocket(gatewayUrl, {
-    socket: tlsSocket,
+    socket: tcpSocket,
   } as any);
 }
 
