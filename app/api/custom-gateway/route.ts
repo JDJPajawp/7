@@ -116,10 +116,16 @@ async function createProxiedWS(gatewayUrl: string, proxyUrl: string): Promise<We
     ? await socks5Connect(proxy, url.hostname, 443)
     : await httpTunnelConnect(proxy, url.hostname, 443);
 
-  // TCPソケットをそのまま渡す。wsがTLSハンドシェイクを自分でやる
   return new WebSocket(gatewayUrl, {
     socket: tcpSocket,
   } as any);
+}
+
+function rawToString(raw: any): string {
+  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
+  if (Array.isArray(raw)) return Buffer.concat(raw as Buffer[]).toString('utf8');
+  return String(raw);
 }
 
 function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false, delayMs = 0, proxy: string | null = null) {
@@ -170,11 +176,10 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
       addLog(`[${token.substring(0, 6)}...] WS connected.`, 'success');
     });
 
-    ws.on('message', (raw: WebSocket.RawData, isBinary: boolean) => {
+    ws.on('message', (raw, isBinary) => {
       try {
-        const str = isBinary
-          ? (Buffer.isBuffer(raw) ? raw.toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8'))
-          : raw.toString();
+        // isBinaryに関わらず常にBuffer変換で統一
+        const str = rawToString(raw);
         const packet = JSON.parse(str);
         const { t, s, op, d } = packet;
         if (s !== null && s !== undefined) session.lastSeq = s;
@@ -317,4 +322,4 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
   }
-    }
+                                            }
