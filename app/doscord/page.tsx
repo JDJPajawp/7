@@ -24,9 +24,6 @@ export default function DoscordPage() {
   const [inviteCode, setInviteCode] = useState('');
   const [isJoining, setIsJoining] = useState(false);
   const [status, setStatus] = useState('');
-  const [autoScroll, setAutoScroll] = useState(true);
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const logBoxRef = useRef<HTMLDivElement>(null);
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
   function getTokens(): string[] {
@@ -66,10 +63,6 @@ export default function DoscordPage() {
     }, 2000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
-
-  useEffect(() => {
-    if (autoScroll) logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs, autoScroll]);
 
   async function handleConnectAll() {
     const tokens = getTokens();
@@ -295,24 +288,14 @@ export default function DoscordPage() {
       )}
 
       {/* ログ */}
-      <div
-        ref={logBoxRef}
-        onScroll={() => {
-          const el = logBoxRef.current;
-          if (!el) return;
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-          setAutoScroll(atBottom);
-        }}
-        className="bg-black rounded-xl p-4 h-64 overflow-y-auto font-mono text-xs space-y-0.5"
-      >
+      <div className="bg-black rounded-xl p-4 h-64 overflow-y-auto font-mono text-xs space-y-0.5">
         {logs.length === 0 && <p className="text-gray-600">ログなし</p>}
         {logs.map(log => (
           <div key={log.id} className={logColor[log.type]}>
             <span className="text-gray-600">[{log.timestamp}]</span> {log.text}
           </div>
         ))}
-        <div ref={logEndRef} />
       </div>
     </div>
   );
-  }
+    }
