@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import WebSocket from 'ws';
 import * as net from 'net';
 import * as http from 'http';
-import * as https from 'https';
+import * as tls from 'tls';
 
 interface GatewaySession {
   ws: WebSocket | null;
@@ -39,9 +39,9 @@ interface ProxyConfig { type: 'socks5' | 'http'; host: string; port: number; use
 
 function parseProxy(proxyUrl: string): ProxyConfig {
   const url = new URL(proxyUrl);
-  const type = url.protocol.replace(':', '') as 'socks5' | 'http';
+  const scheme = url.protocol.replace(':', '');
   return {
-    type: type === ('https' as any) ? 'http' : type,
+    type: scheme === 'socks5' ? 'socks5' : 'http',
     host: url.hostname,
     port: parseInt(url.port, 10),
     username: url.username || undefined,
@@ -52,32 +52,34 @@ function parseProxy(proxyUrl: string): ProxyConfig {
 function socks5Connect(proxy: ProxyConfig, targetHost: string, targetPort: number): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(proxy.port, proxy.host, () => {
-      const greeting = proxy.username ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00]);
+      const greeting = proxy.username
+        ? Buffer.from([0x05, 0x02, 0x00, 0x02])
+        : Buffer.from([0x05, 0x01, 0x00]);
       socket.write(greeting);
       socket.once('data', (data) => {
-        if (data[0] !== 0x05) return reject(new Error('SOCKS5: Invalid version'));
-        const method = data[1];
-        if (method === 0xff) return reject(new Error('SOCKS5: No acceptable auth method'));
-        if (method === 0x02) {
+        if (data[0] !== 0x05) return reject(new Error('SOCKS5: bad version'));
+        if (data[1] === 0xff) return reject(new Error('SOCKS5: no acceptable method'));
+        if (data[1] === 0x02) {
           const user = Buffer.from(proxy.username || '');
           const pass = Buffer.from(proxy.password || '');
-          const authReq = Buffer.alloc(3 + user.length + pass.length);
-          authReq[0] = 0x01; authReq[1] = user.length; user.copy(authReq, 2);
-          authReq[2 + user.length] = pass.length; pass.copy(authReq, 3 + user.length);
-          socket.write(authReq);
-          socket.once('data', (authRes) => {
-            if (authRes[1] !== 0x00) return reject(new Error('SOCKS5: Auth failed'));
+          const auth = Buffer.alloc(3 + user.length + pass.length);
+          auth[0] = 0x01; auth[1] = user.length; user.copy(auth, 2);
+          auth[2 + user.length] = pass.length; pass.copy(auth, 3 + user.length);
+          socket.write(auth);
+          socket.once('data', (r) => {
+            if (r[1] !== 0x00) return reject(new Error('SOCKS5: auth failed'));
             sendConnect();
           });
         } else { sendConnect(); }
         function sendConnect() {
-          const hostBuf = Buffer.from(targetHost);
-          const req = Buffer.alloc(7 + hostBuf.length);
+          const host = Buffer.from(targetHost);
+          const req = Buffer.alloc(7 + host.length);
           req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-          req[4] = hostBuf.length; hostBuf.copy(req, 5); req.writeUInt16BE(targetPort, 5 + hostBuf.length);
+          req[4] = host.length; host.copy(req, 5);
+          req.writeUInt16BE(targetPort, 5 + host.length);
           socket.write(req);
-          socket.once('data', (res) => {
-            if (res[1] !== 0x00) return reject(new Error(`SOCKS5: Connect failed (${res[1]})`));
+          socket.once('data', (r) => {
+            if (r[1] !== 0x00) return reject(new Error(`SOCKS5: connect failed (${r[1]})`));
             resolve(socket);
           });
         }
@@ -92,14 +94,16 @@ function socks5Connect(proxy: ProxyConfig, targetHost: string, targetPort: numbe
 function httpTunnelConnect(proxy: ProxyConfig, targetHost: string, targetPort: number): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: proxy.host, port: proxy.port, method: 'CONNECT',
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
       path: `${targetHost}:${targetPort}`,
       headers: proxy.username
         ? { 'Proxy-Authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}` }
         : {},
     });
     req.setTimeout(10000, () => { req.destroy(); reject(new Error('HTTP CONNECT: timeout')); });
-    req.on('connect', (_res, socket) => { resolve(socket); });
+    req.on('connect', (_res, socket) => resolve(socket));
     req.on('error', reject);
     req.end();
   });
@@ -110,11 +114,28 @@ async function createProxiedWS(gatewayUrl: string, proxyUrl: string): Promise<We
   const url = new URL(gatewayUrl);
   const targetHost = url.hostname;
   const targetPort = 443;
-  const socket = proxy.type === 'socks5'
+
+  // TCPトンネルを張る
+  const tcpSocket = proxy.type === 'socks5'
     ? await socks5Connect(proxy, targetHost, targetPort)
     : await httpTunnelConnect(proxy, targetHost, targetPort);
-  const agent = new https.Agent({ socket } as any);
-  return new WebSocket(gatewayUrl, { agent });
+
+  // TCPトンネルの上にTLSを張る
+  const tlsSocket = tls.connect({
+    socket: tcpSocket,
+    servername: targetHost,
+    rejectUnauthorized: true,
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    tlsSocket.once('secureConnect', resolve);
+    tlsSocket.once('error', reject);
+  });
+
+  // TLSソケットをwsに直接渡す
+  return new WebSocket(gatewayUrl, {
+    socket: tlsSocket,
+  } as any);
 }
 
 function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false, delayMs = 0, proxy: string | null = null) {
@@ -136,12 +157,14 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
 
   const prev = global.activeSessions.get(token);
   const proxyToUse = proxy ?? prev?.proxy ?? null;
+
   const session: GatewaySession = {
     ws: null, heartbeatTimer: null, token, tokenType, isConnecting: true,
     sessionId: (resume && prev?.sessionId) || null,
     resumeGatewayUrl: (resume && prev?.resumeGatewayUrl) || null,
     lastSeq: (resume && prev?.lastSeq) || null,
-    fatalClose: false, proxy: proxyToUse,
+    fatalClose: false,
+    proxy: proxyToUse,
   };
   global.activeSessions.set(token, session);
 
@@ -166,7 +189,7 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
     ws.on('message', (raw: WebSocket.RawData, isBinary: boolean) => {
       try {
         const str = isBinary
-          ? Buffer.isBuffer(raw) ? raw.toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8')
+          ? (Buffer.isBuffer(raw) ? raw.toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8'))
           : raw.toString();
         const packet = JSON.parse(str);
         const { t, s, op, d } = packet;
@@ -179,6 +202,7 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
           session.heartbeatTimer = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ op: 1, d: session.lastSeq }));
           }, interval);
+
           if (resume && session.sessionId && session.lastSeq !== null) {
             addLog(`[${token.substring(0, 6)}...] Sending RESUME (Op 6)...`, 'info');
             ws.send(JSON.stringify({ op: 6, d: { token: tokenType === 'bot' ? `Bot ${token}` : token, session_id: session.sessionId, seq: session.lastSeq } }));
@@ -205,11 +229,10 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
         }
 
         if (op === 9) {
-          const resumable: boolean = d;
-          addLog(`[${token.substring(0, 6)}...] Invalid Session (resumable=${resumable})`, 'warn');
+          addLog(`[${token.substring(0, 6)}...] Invalid Session (resumable=${d})`, 'warn');
           session.sessionId = null; session.lastSeq = null;
           ws.close();
-          connectGateway(token, tokenType, resumable, 5000, proxyToUse);
+          connectGateway(token, tokenType, d === true, 5000, proxyToUse);
           return;
         }
 
@@ -244,7 +267,7 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
       if (FATAL_CLOSE_CODES.has(code)) {
         session.fatalClose = true;
         global.activeSessions.delete(token);
-        addLog(`[${token.substring(0, 6)}...] Fatal close ${code}. Token may be banned.`, 'error');
+        addLog(`[${token.substring(0, 6)}...] Fatal close ${code}. Token may be invalid/banned.`, 'error');
         return;
       }
       if (!global.activeSessions.has(token)) return;
@@ -252,7 +275,7 @@ function connectGateway(token: string, tokenType: 'bot' | 'user', resume = false
       connectGateway(token, tokenType, code === 4009, delay, proxyToUse);
     });
   }).catch((err) => {
-    addLog(`[${token.substring(0, 6)}...] Proxy connect failed: ${err.message}`, 'error');
+    addLog(`[${token.substring(0, 6)}...] Proxy/WS connect failed: ${err.message}`, 'error');
     global.activeSessions.delete(token);
   });
 }
